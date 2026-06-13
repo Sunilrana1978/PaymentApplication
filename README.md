@@ -305,10 +305,94 @@ stripe trigger charge.succeeded
 
 ## How Idempotency Works
 
-1. Client generates a UUID v4 on the first "Pay" click and stores it in `localStorage`
-2. The same key is reused on every retry for that order
-3. Lambda checks DynamoDB `idempotency-cache` before processing — if the key exists, the cached response is returned immediately with no charge
-4. Cache entries expire automatically after 24 hours via DynamoDB TTL
+Idempotency ensures that no matter how many times a payment request is submitted with the same key — due to a double-click, network timeout, retry, or page refresh — **only one charge is ever created**.
+
+### Key generation (client side)
+
+```
+User clicks "Pay"
+      │
+      ▼
+localStorage has key for this orderId?
+      │
+   Yes│                    No│
+      ▼                      ▼
+Reuse existing key      Generate UUID v4
+(within 1h TTL)         Store in localStorage
+                        under "payment_<orderId>"
+      │                      │
+      └──────────┬───────────┘
+                 ▼
+      Attach key to every request
+      (body: idempotencyKey + header: X-Idempotency-Key)
+```
+
+- The key is generated **once** per order on the very first "Pay" click.
+- It is stored in `localStorage` with a 1-hour TTL so the same key survives page refreshes and network retries.
+- On success or a non-retryable failure (e.g. card declined), the key is cleared from `localStorage`.
+
+### Server-side deduplication (Lambda + DynamoDB)
+
+```
+POST /api/v1/payments/create  {idempotencyKey: "uuid-v4", ...}
+      │
+      ▼
+1. Validate idempotency key format (must be UUID v4)
+      │
+      ▼
+2. DynamoDB GetItem on IdempotencyCacheTable
+      │
+   Hit│                   Miss│
+      ▼                       ▼
+Return cached            3. Validate payload
+response (HTTP 200)         (amount, currency, token, customerId, orderId)
+← no Stripe call                │
+← no second charge              ▼
+                         4. Fraud checks
+                            • Velocity: >5 charges by same customer in 5 min → block
+                            • Anomaly: >10× 90-day avg → log & flag
+                                │
+                                ▼
+                         5. stripe.charges.create
+                                │
+                                ▼
+                         6. DynamoDB PutItem → TransactionsTable
+                            (condition: attribute_not_exists — immutable write)
+                                │
+                                ▼
+                         7. DynamoDB PutItem → IdempotencyCacheTable
+                            (TTL = now + 24h)
+                                │
+                                ▼
+                         Return success response
+```
+
+### What the cache stores
+
+Each entry in `IdempotencyCacheTable` holds the original response payload so that replays return **identical data** — same `transactionId`, same `amount`, same `timestamp`:
+
+| Field | Value |
+|-------|-------|
+| `idempotencyKey` (PK) | UUID v4 from the client |
+| `response` | Serialised success/error response |
+| `ttl` | Unix epoch — 24 hours from first request |
+
+DynamoDB TTL deletes the entry automatically after 24 hours; no cleanup job needed.
+
+### Scenario walkthrough
+
+| Scenario | What happens |
+|----------|-------------|
+| User double-clicks "Pay" | Second request arrives with the same key while first is in-flight — server processes it sequentially; DynamoDB conditional write on `TransactionsTable` ensures only one record is inserted |
+| Network timeout on first attempt | Client retries with the same `localStorage` key → cache hit → same response, no new charge |
+| Page refresh mid-payment | Key is still in `localStorage` (1h TTL) → retry reuses key → cache hit if first attempt succeeded |
+| User opens a new tab | `localStorage` is shared across tabs → same key → deduplicated |
+| 24+ hours later, user retries | Cache entry has expired → treated as a new payment → new charge (expected) |
+| Non-retryable error (card declined) | Key is cleared from `localStorage` → next attempt generates a fresh key (correct — no charge to deduplicate) |
+
+### Why UUID v4?
+
+UUIDs are validated server-side with a strict regex. Sequential or predictable keys would let callers "guess" another customer's key and hijack their cached response. UUID v4 has ~122 bits of entropy, making collisions statistically impossible.
 
 Double-clicks, network timeouts, and page refreshes are all safe — only one charge ever occurs per order.
 
