@@ -1,0 +1,24 @@
+{
+  "name": "payment-application",
+  "version": "1.0.0",
+  "description": "Secure idempotent payment processing system",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "db:init": "node -e \"require('./src/db/schema').initializeDatabase()\""
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "express-rate-limit": "^6.0.0",
+    "helmet": "^7.0.0",
+    "pg": "^8.11.0",
+    "stripe": "^14.0.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}

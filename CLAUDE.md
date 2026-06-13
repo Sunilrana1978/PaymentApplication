@@ -6,31 +6,54 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A secure, idempotent payment processing system built with Node.js/Express and Stripe. The system prevents duplicate charges through server-side idempotency caching in PostgreSQL and client-side idempotency key persistence in `localStorage`.
 
+## Project Structure
+
+```
+PaymentApplication/
+├── src/
+│   ├── config/db.js              # PostgreSQL pool (pg.Pool)
+│   ├── db/schema.js              # initializeDatabase() — creates all tables
+│   ├── utils/logger.js           # PaymentLogger singleton
+│   ├── utils/hash.js             # hashPayload(), validateIdempotencyKey()
+│   ├── services/PaymentProcessor.js  # Core payment logic class
+│   ├── routes/payments.js        # Express route handlers
+│   └── app.js                    # Express app setup (middleware, routes)
+├── public/js/
+│   └── payment-handler.js        # Browser client: SecurePaymentHandler, RequestCache
+├── docs/
+│   ├── api-spec.md               # Full API request/response spec
+│   └── integration-guide.md     # Step-by-step integration guide
+├── index.js                      # Entry point: DB init + app.listen
+├── package.json
+├── .env.example
+└── .gitignore
+```
+
 ## Setup
 
 **Install dependencies:**
 ```bash
-npm install express pg stripe uuid dotenv cors helmet express-rate-limit
+npm install
 ```
 
-**Environment variables** (create a `.env` file):
+**Environment variables** — copy `.env.example` to `.env` and fill in values:
 ```
 DATABASE_URL=postgresql://user:password@localhost:5432/shopping_app
 STRIPE_SECRET_KEY=sk_live_...
 STRIPE_PUBLISHABLE_KEY=pk_live_...
-STRIPE_WEBHOOK_SECRET=whsec_...
 PORT=3000
 ALLOWED_ORIGINS=https://yourdomain.com
 ```
 
-**Initialize the database schema:**
+**Initialize database schema:**
 ```bash
-node -e "require('./payment-processor-server').initializeDatabase()"
+npm run db:init
 ```
 
 **Start the server:**
 ```bash
-node payment-processor-server.js
+npm start          # production
+npm run dev        # development (nodemon)
 ```
 
 **Test a payment:**
@@ -56,12 +79,6 @@ stripe trigger charge.succeeded
 
 ## Architecture
 
-### Files
-- **`payment-processor-server.js`** — Express server with `PaymentProcessor` class (main logic), `PaymentLogger` class, DB schema init, and routes.
-- **`payment-handler-client.js`** — Browser-side `SecurePaymentHandler` class (Stripe Elements, idempotency key management, retry logic) and `RequestCache` class (localStorage wrapper with TTL).
-- **`payment-api-spec.md`** — Full API request/response spec, idempotency mechanism, error codes, and DB schema.
-- **`integration-guide.md`** — Step-by-step integration guide for embedding into a shopping application.
-
 ### Payment Flow (Server-side, `PaymentProcessor.processPayment`)
 1. Validate idempotency key (must be UUID v4)
 2. **Check `idempotency_cache`** — return cached response immediately if found (prevents double charges)
@@ -71,7 +88,7 @@ stripe trigger charge.succeeded
 6. Write to `transactions` table (immutable audit trail)
 7. Cache success response in `idempotency_cache` (24h TTL)
 
-### Idempotency Key Lifecycle (Client-side)
+### Idempotency Key Lifecycle (Client-side, `SecurePaymentHandler`)
 - Generated once per order as UUID v4 on first "Pay" click; stored in `localStorage` under `payment_<orderId>` with 1-hour TTL via `RequestCache`
 - Reused on all retries for the same order — this is what prevents double charges on timeout/page refresh
 - Deleted from localStorage on success or non-retryable failure
@@ -100,5 +117,5 @@ Expiry: 12/25, CVC: any 3 digits
 
 - **Never send raw card data to the server** — `validatePayload` rejects tokens that look like card numbers (16-digit starting with 4). Card data is tokenized client-side via Stripe Elements before any network call.
 - **Amounts are always in cents (smallest currency unit)** — $99.99 = `9999`.
-- **Cache entries expire after 24 hours** — run `POST /admin/cleanup-cache` or a pg_cron job to purge expired rows.
-- The `simpleHash` in `payment-handler-client.js` is a placeholder — production use should replace with `crypto.subtle` for the cart checksum.
+- **Cache entries expire after 24 hours** — run `POST /api/v1/payments/admin/cleanup-cache` or a pg_cron job to purge expired rows.
+- The `simpleHash` in `public/js/payment-handler.js` is a placeholder — production use should replace with `crypto.subtle` for the cart checksum.
