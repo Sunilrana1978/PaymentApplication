@@ -42,6 +42,9 @@ No VPC, no servers, no infrastructure to manage. Scales to zero when idle.
 
 ```
 PaymentApplication/
+├── .github/workflows/
+│   ├── ci.yml                        # CI — runs on every PR (audit, validate template)
+│   └── deploy.yml                    # CD — deploys to AWS on push to main
 ├── src/
 │   ├── config/dynamodb.js            # DynamoDB Document Client (AWS SDK v3)
 │   ├── utils/logger.js               # Payment event logger (DynamoDB)
@@ -54,9 +57,11 @@ PaymentApplication/
 ├── docs/
 │   ├── api-spec.md                   # Full API request/response specification
 │   ├── integration-guide.md          # Frontend integration guide
-│   └── aws-deployment.md            # Step-by-step AWS deployment guide
+│   ├── aws-deployment.md             # Step-by-step AWS deployment guide
+│   └── cicd-setup.md                 # CI/CD pipeline setup guide
 ├── infrastructure/
-│   └── cloudformation.yml           # Full serverless stack (Lambda, API GW, DynamoDB)
+│   ├── cloudformation.yml            # Serverless app stack (Lambda, API GW, DynamoDB)
+│   └── github-oidc.yml              # One-time OIDC setup (GitHub → AWS auth)
 ├── lambda.js                         # AWS Lambda entry point
 ├── index.js                          # Local development entry point
 ├── docker-compose.yml               # Local dev with DynamoDB Local
@@ -124,6 +129,50 @@ aws dynamodb create-table \
   --billing-mode PAY_PER_REQUEST \
   --endpoint-url http://localhost:8000 --region us-east-1
 ```
+
+## CI/CD Pipeline
+
+Every push to `main` automatically deploys to production via GitHub Actions.
+
+```
+Pull Request ──► CI (audit + validate template)
+                        │
+                 merge to main
+                        │
+                        ▼
+             Deploy workflow
+                  │
+       ┌──────────┼──────────┐
+       ▼          ▼          ▼
+    Package    Upload     Deploy
+    (ZIP)       (S3)  (CloudFormation)
+                           │
+                           ▼
+                     Smoke tests
+               (health check + payment endpoint)
+```
+
+| Workflow | Trigger | Steps |
+|----------|---------|-------|
+| `ci.yml` | Every PR and push | `npm audit`, CloudFormation template validation |
+| `deploy.yml` | Push to `main` or manual | Package → S3 → CloudFormation → smoke test |
+
+**Authentication uses GitHub OIDC** — no long-lived AWS access keys stored in GitHub secrets. The `infrastructure/github-oidc.yml` stack creates a scoped IAM role that GitHub Actions assumes via short-lived tokens.
+
+**Required GitHub secrets:**
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_ROLE_ARN` | IAM role ARN from the OIDC stack |
+| `LAMBDA_DEPLOY_BUCKET` | S3 bucket for Lambda ZIPs |
+| `STRIPE_SECRET_KEY` | `sk_live_...` |
+| `STRIPE_PUBLISHABLE_KEY` | `pk_live_...` |
+| `STRIPE_WEBHOOK_SECRET` | `whsec_...` |
+| `ALLOWED_ORIGINS` | `https://yourdomain.com` |
+
+Each Lambda package is named `payment-app-{commit-sha}.zip`, making rollback as simple as redeploying with a previous SHA.
+
+See [`docs/cicd-setup.md`](docs/cicd-setup.md) for the full setup guide (OIDC stack, GitHub secrets, environment protection rules).
 
 ## AWS Deployment
 
@@ -279,4 +328,5 @@ All tables have point-in-time recovery enabled and `DeletionPolicy: Retain` — 
 - [API Specification](docs/api-spec.md)
 - [Integration Guide](docs/integration-guide.md)
 - [AWS Deployment Guide](docs/aws-deployment.md)
+- [CI/CD Setup Guide](docs/cicd-setup.md)
 - [PCI DSS Standards](https://www.pcisecuritystandards.org/)
