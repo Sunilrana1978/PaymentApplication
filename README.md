@@ -396,6 +396,137 @@ UUIDs are validated server-side with a strict regex. Sequential or predictable k
 
 Double-clicks, network timeouts, and page refreshes are all safe — only one charge ever occurs per order.
 
+## How Retry Logic Works
+
+Network failures and transient errors are retried automatically — without creating duplicate charges — by combining exponential backoff with the idempotency key from `localStorage`.
+
+### Retry loop (`submitPaymentWithRetry`)
+
+```
+User clicks "Pay"
+      │
+      ▼
+Attempt 1
+      │
+   Success?──Yes──► Return result, clear localStorage key
+      │
+      No
+      │
+   Retryable?──No──► Return error to user (no more attempts)
+      │
+     Yes
+      │
+   Last attempt (3)?──Yes──► Return error to user
+      │
+      No
+      │
+   Wait (exponential backoff)
+      │
+      ▼
+Attempt 2  (after 2 s)
+      │
+      ... same checks ...
+      │
+Attempt 3  (after 4 s)
+      │
+   Return whatever the final result is
+```
+
+### Backoff timing
+
+| Attempt | Delay before this attempt | Cumulative wait |
+|---------|--------------------------|-----------------|
+| 1 | 0 s (immediate) | 0 s |
+| 2 | 2 s (`2¹ × 1000 ms`) | 2 s |
+| 3 | 4 s (`2² × 1000 ms`) | 6 s |
+
+Formula: `Math.pow(2, attempt) * 1000` — applied **after** a failed attempt, before the next one. No wait after the final attempt.
+
+### Per-request timeout
+
+Each individual attempt has a **30-second `AbortController` timeout**. If the server does not respond in 30 s, the request is aborted and treated as a retryable network error:
+
+```
+fetch() ──► AbortController fires at 30 s
+                    │
+                    ▼
+          throws AbortError
+                    │
+                    ▼
+       "Request timeout - payment
+        may still be processing"
+                    │
+                    ▼
+          retryable: true
+          (retry with same idempotency key)
+```
+
+The timeout message warns that the server **may have processed** the charge. The same idempotency key is reused on retry, so even if the first attempt succeeded server-side, the retry returns the cached response — no double charge.
+
+### Retryable vs non-retryable errors
+
+| Error source | Error | `retryable` | What happens |
+|---|---|---|---|
+| Stripe client (browser) | Card tokenization failed | `false` | Returned to user immediately, no server call made |
+| Server — validation | `invalid_amount`, `invalid_currency`, etc. | `false` | Returned to user immediately |
+| Server — card | `card_declined` | `false` | Returned to user immediately |
+| Server — card | `insufficient_funds` | `false` | Returned to user immediately |
+| Server — fraud | `fraud_detected` (HTTP 403) | `true`* | Retried (but all retries hit the same velocity window and are also blocked) |
+| Server — rate limit | `rate_limit` | `true` | Retried after backoff |
+| Server — unknown | `payment_failed` | `true` | Retried after backoff |
+| Network | Fetch error, DNS failure | `true` | Retried after backoff |
+| Network | Timeout (AbortError) | `true` | Retried after backoff |
+| Server — HTTP 5xx | Any 5xx status | `true` | Retried after backoff |
+
+\* HTTP 403 is not parsed as JSON — it throws a network-style error in `sendPaymentRequest` and lands in the `catch` block as `retryable: true`. In practice the retries all fail too because the velocity window (5 min) is far longer than the total backoff (6 s).
+
+### How retries stay safe (idempotency key reuse)
+
+The same idempotency key is used across **all attempts** for an order:
+
+```
+Attempt 1  ──► idempotencyKey: "abc-123"  ──► Server processes, stores in cache
+               (network drops before response)
+                         │
+Attempt 2  ──► idempotencyKey: "abc-123"  ──► Cache HIT → return same response
+               (no second charge)
+                         │
+Attempt 3  ──► (not reached — attempt 2 succeeded)
+```
+
+The key comes from `localStorage` (`payment_<orderId>`, 1h TTL), so it survives page refreshes between attempts.
+
+### Double-click and race-condition protection
+
+Two independent layers prevent a second submission while one is already in-flight:
+
+1. **Button disabled** — `handlePaymentSubmit` sets `button.disabled = true` at the start and only re-enables it on success or final failure.
+2. **`DuplicateSubmissionDetector`** (1 s debounce) — ignores any click that arrives within 1 s of the previous one, before the button-disable has a chance to take effect.
+
+Together these ensure `submitPaymentWithRetry` is called at most once per user action, even on fast double-clicks or keyboard-enter bounces.
+
+### What happens after all retries are exhausted
+
+```
+All 3 attempts failed (retryable errors)
+               │
+               ▼
+  result.retryable === true but attempt === maxRetries
+               │
+               ▼
+  Return final error result to UI
+               │
+        ┌──────┴──────┐
+        ▼             ▼
+  Show error     Keep idempotency
+  message to     key in localStorage
+  user           (so user can click
+                  "Try Again" manually
+                  and still be safe)
+```
+
+The idempotency key is only cleared from `localStorage` on **success** or a **non-retryable** failure (e.g. card declined). After exhausting retries on transient errors, the key is preserved so a manual retry by the user is still deduplicated.
+
 ## How Fraud Detection Works
 
 Two independent checks run on every new payment request (cache misses only — replays skip fraud checks entirely).
