@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const pool = require('./config/db');
 
 const app = express();
 
@@ -14,7 +13,7 @@ const corsOptions = {
   origin: (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(','),
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Idempotency-Key']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Idempotency-Key', 'X-Request-Id']
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
@@ -28,13 +27,8 @@ app.use('/api/', limiter);
 
 app.use('/api/v1/payments', require('./routes/payments'));
 
-app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'healthy', service: 'payment-processor' });
-  } catch (err) {
-    res.status(500).json({ status: 'unhealthy', error: err.message });
-  }
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', service: 'payment-processor' });
 });
 
 module.exports = app;

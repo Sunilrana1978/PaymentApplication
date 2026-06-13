@@ -4,118 +4,109 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A secure, idempotent payment processing system built with Node.js/Express and Stripe. The system prevents duplicate charges through server-side idempotency caching in PostgreSQL and client-side idempotency key persistence in `localStorage`.
+A secure, idempotent payment processing system. Serverless architecture: AWS Lambda (Node.js/Express via `serverless-http`) + API Gateway HTTP API + DynamoDB. Prevents duplicate charges through DynamoDB-backed idempotency caching and client-side `localStorage` key persistence.
 
 ## Project Structure
 
 ```
 PaymentApplication/
 ├── src/
-│   ├── config/db.js              # PostgreSQL pool (pg.Pool)
-│   ├── db/schema.js              # initializeDatabase() — creates all tables
-│   ├── utils/logger.js           # PaymentLogger singleton
-│   ├── utils/hash.js             # hashPayload(), validateIdempotencyKey()
-│   ├── services/PaymentProcessor.js  # Core payment logic class
-│   ├── routes/payments.js        # Express route handlers
-│   └── app.js                    # Express app setup (middleware, routes)
+│   ├── config/dynamodb.js            # DynamoDB Document Client (AWS SDK v3)
+│   ├── utils/logger.js               # PaymentLogger — writes to PaymentLogsTable
+│   ├── utils/hash.js                 # hashPayload(), validateIdempotencyKey()
+│   ├── services/PaymentProcessor.js  # Core payment logic (DynamoDB + Stripe)
+│   ├── routes/payments.js            # Express routes
+│   └── app.js                        # Express app setup (middleware, routes)
 ├── public/js/
-│   └── payment-handler.js        # Browser client: SecurePaymentHandler, RequestCache
+│   └── payment-handler.js            # Browser client (Stripe Elements + idempotency)
 ├── docs/
-│   ├── api-spec.md               # Full API request/response spec
-│   └── integration-guide.md     # Step-by-step integration guide
-├── index.js                      # Entry point: DB init + app.listen
+│   ├── api-spec.md                   # Full API request/response specification
+│   ├── integration-guide.md          # Frontend integration guide
+│   └── aws-deployment.md            # Step-by-step AWS deployment guide
+├── infrastructure/
+│   └── cloudformation.yml           # Full serverless stack definition
+├── lambda.js                         # AWS Lambda entry point (wraps Express)
+├── index.js                          # Local development entry point
+├── docker-compose.yml               # Local dev with DynamoDB Local
+├── Dockerfile
 ├── package.json
-├── .env.example
-└── .gitignore
+└── .env.example
 ```
 
-## Setup
+## Commands
 
-**Install dependencies:**
+**Local development (with DynamoDB Local):**
+```bash
+cp .env.example .env   # fill in STRIPE_SECRET_KEY
+docker-compose up      # app on :3000, DynamoDB Admin UI on :8001
+```
+
+Run the local DynamoDB table setup commands from `docs/aws-deployment.md` on first start.
+
+**Run server directly (requires AWS credentials + real DynamoDB tables):**
 ```bash
 npm install
+npm run dev    # nodemon
+npm start      # node
 ```
 
-**Environment variables** — copy `.env.example` to `.env` and fill in values:
-```
-DATABASE_URL=postgresql://user:password@localhost:5432/shopping_app
-STRIPE_SECRET_KEY=sk_live_...
-STRIPE_PUBLISHABLE_KEY=pk_live_...
-PORT=3000
-ALLOWED_ORIGINS=https://yourdomain.com
-```
-
-**Initialize database schema:**
+**Deploy to AWS:**
 ```bash
-npm run db:init
-```
+# Package
+npm ci --only=production
+zip -r payment-app.zip . --exclude "*.git*" --exclude "docs/*" --exclude "infrastructure/*" --exclude "*.md" --exclude ".env*" --exclude "docker-compose.yml" --exclude "public/*"
+aws s3 cp payment-app.zip s3://YOUR-DEPLOY-BUCKET/
 
-**Start the server:**
-```bash
-npm start          # production
-npm run dev        # development (nodemon)
-```
-
-**Test a payment:**
-```bash
-curl -X POST http://localhost:3000/api/v1/payments/create \
-  -H "Content-Type: application/json" \
-  -H "X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
-  -d '{
-    "idempotencyKey": "550e8400-e29b-41d4-a716-446655440000",
-    "paymentMethod": { "type": "card_token", "token": "tok_visa" },
-    "transaction": { "amount": 9999, "currency": "USD", "orderId": "ORD-12345" },
-    "customer": { "customerId": "cust_123", "email": "test@example.com", "billingAddress": { "zip": "97201", "country": "US" } }
-  }'
-```
-
-**Health check:** `GET /health`
-
-**Test webhooks locally:**
-```bash
-stripe listen --forward-to localhost:3000/api/v1/payments/webhook
-stripe trigger charge.succeeded
+# Deploy
+aws cloudformation deploy \
+  --template-file infrastructure/cloudformation.yml \
+  --stack-name payment-app-production \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides Environment=production LambdaCodeBucket=YOUR-BUCKET ...
 ```
 
 ## Architecture
 
-### Payment Flow (Server-side, `PaymentProcessor.processPayment`)
+### Payment Flow (`PaymentProcessor.processPayment`)
 1. Validate idempotency key (must be UUID v4)
-2. **Check `idempotency_cache`** — return cached response immediately if found (prevents double charges)
-3. Validate payload (amount, currency ISO 4217, token not raw card, customerId, orderId)
-4. Fraud checks: velocity (>5 transactions per customer in 5 minutes = blocked), amount anomaly (>10x historical average = logged)
+2. **DynamoDB `GetItem` on `IdempotencyCacheTable`** — return cached response immediately if found
+3. Validate payload (amount, currency, token, customerId, orderId)
+4. Fraud checks: velocity (`QueryCommand` on `customerId-createdAt-index`, >5 in 5 min = blocked) and anomaly (>10x 90-day average = logged only)
 5. Charge via `stripe.charges.create`
-6. Write to `transactions` table (immutable audit trail)
-7. Cache success response in `idempotency_cache` (24h TTL)
+6. **DynamoDB `PutItem` on `TransactionsTable`** with `attribute_not_exists` condition (immutable write)
+7. **DynamoDB `PutItem` on `IdempotencyCacheTable`** with 24h TTL
 
-### Idempotency Key Lifecycle (Client-side, `SecurePaymentHandler`)
-- Generated once per order as UUID v4 on first "Pay" click; stored in `localStorage` under `payment_<orderId>` with 1-hour TTL via `RequestCache`
-- Reused on all retries for the same order — this is what prevents double charges on timeout/page refresh
-- Deleted from localStorage on success or non-retryable failure
-- Sent in both the request body (`idempotencyKey`) and `X-Idempotency-Key` header
+### DynamoDB Tables
+| Table | PK | SK | TTL | Notes |
+|-------|----|----|-----|-------|
+| `payment-idempotency-cache-{env}` | `idempotencyKey` | — | 24h | Blocks double charges |
+| `payment-transactions-{env}` | `transactionId` | — | — | Immutable audit trail; GSI on `customerId+createdAt` for fraud checks |
+| `payment-logs-{env}` | `idempotencyKey` | `timestamp` | 90d | Event log per payment step |
 
-### Database Tables (PostgreSQL)
-- **`idempotency_cache`** — keyed by `idempotency_key` (UUID), stores full request+response JSON, expires after 24h
-- **`transactions`** — immutable audit trail; one row per successful charge, references `stripe_charge_id`
-- **`payment_logs`** — event log for every step (CACHE_HIT, CHARGE_SUCCESS, etc.) with `request_id` for tracing
+### Lambda Entry Point
+`lambda.js` wraps the Express app with `serverless-http`. The same Express app runs locally via `index.js`. No code change needed between environments.
 
-### Retryable vs Non-retryable Errors
-Retryable: `insufficient_funds`, `timeout`, `rate_limit`
-Non-retryable: `card_declined`, `invalid_token`, `duplicate_transaction`, `invalid_amount`
+### Environment Variables (Lambda auto-injects from CloudFormation)
+- `IDEMPOTENCY_CACHE_TABLE`, `TRANSACTIONS_TABLE`, `PAYMENT_LOGS_TABLE` — table names
+- `STRIPE_SECRET_KEY`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_WEBHOOK_SECRET` — resolved from Secrets Manager at deploy time
+- `DYNAMODB_ENDPOINT` — set to `http://localhost:8000` for local dev with DynamoDB Local; omit for AWS
 
-Client uses exponential backoff (2s, 4s, 8s) for retryable errors up to 3 attempts.
+### Idempotency Key Lifecycle (Client-side)
+- UUID v4 generated on first "Pay" click, stored in `localStorage` under `payment_<orderId>` (1h TTL)
+- Reused on every retry → server cache hit → no double charge
+- Cleared on success or non-retryable failure
 
-### Stripe Test Cards
+## Key Invariants
+- **Raw card data never reaches the server** — `validatePayload` rejects 16-digit tokens starting with `4`. Card data tokenized client-side via Stripe Elements.
+- **Amounts are always in cents** — $99.99 → `9999`.
+- **DynamoDB TTL handles cache expiry** — `idempotency_cache` expires after 24h, logs after 90 days. No cleanup jobs needed.
+- **`DeletionPolicy: Retain`** on all DynamoDB tables — deleting the CloudFormation stack does NOT delete transaction data.
+- The `simpleHash` in `public/js/payment-handler.js` is a placeholder — replace with `crypto.subtle` for production cart checksums.
+
+## Stripe Test Cards
 ```
 Success:  4242 4242 4242 4242
 Decline:  4000 0000 0000 0002
 No funds: 4000 0000 0000 9995
-Expiry: 12/25, CVC: any 3 digits
+Expiry: any future date, CVC: any 3 digits
 ```
-
-## Key Invariants
-
-- **Never send raw card data to the server** — `validatePayload` rejects tokens that look like card numbers (16-digit starting with 4). Card data is tokenized client-side via Stripe Elements before any network call.
-- **Amounts are always in cents (smallest currency unit)** — $99.99 = `9999`.
-- **Cache entries expire after 24 hours** — run `POST /api/v1/payments/admin/cleanup-cache` or a pg_cron job to purge expired rows.
-- The `simpleHash` in `public/js/payment-handler.js` is a placeholder — production use should replace with `crypto.subtle` for the cart checksum.

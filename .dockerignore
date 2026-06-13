@@ -1,0 +1,10 @@
+node_modules
+.env
+.git
+.DS_Store
+*.log
+docs
+infrastructure
+public
+README.md
+CLAUDE.md

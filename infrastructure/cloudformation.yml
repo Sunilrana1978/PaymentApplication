@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Payment Application - Serverless (Lambda + API Gateway HTTP API + DynamoDB)
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment ZIP
+
+  LambdaCodeKey:
+    Type: String
+    Default: payment-app.zip
+    Description: S3 key for the Lambda deployment ZIP
+
+  StripeSecretKey:
+    Type: String
+    NoEcho: true
+    Description: Stripe secret key (sk_live_...)
+
+  StripePublishableKey:
+    Type: String
+    Description: Stripe publishable key (pk_live_...)
+
+  StripeWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: Stripe webhook signing secret (whsec_...)
+
+  AllowedOrigins:
+    Type: String
+    Default: https://yourdomain.com
+    Description: Comma-separated CORS allowed origins
+
+# ==============================================================================
+# MAPPINGS
+# ==============================================================================
+
+Mappings:
+  EnvConfig:
+    development:
+      LambdaMemory: 256
+      LambdaTimeout: 30
+      LogRetentionDays: 7
+    staging:
+      LambdaMemory: 512
+      LambdaTimeout: 30
+      LogRetentionDays: 14
+    production:
+      LambdaMemory: 512
+      LambdaTimeout: 30
+      LogRetentionDays: 30
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # DYNAMODB TABLES
+  # ----------------------------------------------------------------------------
+
+  IdempotencyCacheTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub payment-idempotency-cache-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotencyKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotencyKey
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub payment-transactions-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: transactionId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transactionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customerId-createdAt-index
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  PaymentLogsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub payment-logs-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotencyKey
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotencyKey
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # ----------------------------------------------------------------------------
+  # SECRETS MANAGER
+  # ----------------------------------------------------------------------------
+
+  StripeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub payment-app/${Environment}/stripe
+      Description: Stripe API keys
+      SecretString: !Sub |
+        {
+          "secret_key": "${StripeSecretKey}",
+          "publishable_key": "${StripePublishableKey}",
+          "webhook_secret": "${StripeWebhookSecret}"
+        }
+
+  # ----------------------------------------------------------------------------
+  # IAM ROLE
+  # ----------------------------------------------------------------------------
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub payment-app-lambda-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt IdempotencyCacheTable.Arn
+                  - !GetAtt TransactionsTable.Arn
+                  - !Sub '${TransactionsTable.Arn}/index/*'
+                  - !GetAtt PaymentLogsTable.Arn
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref StripeSecret
+
+  # ----------------------------------------------------------------------------
+  # CLOUDWATCH LOGS
+  # ----------------------------------------------------------------------------
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/payment-app-${Environment}
+      RetentionInDays: !FindInMap [EnvConfig, !Ref Environment, LogRetentionDays]
+
+  # ----------------------------------------------------------------------------
+  # LAMBDA FUNCTION
+  # ----------------------------------------------------------------------------
+
+  PaymentLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: LogGroup
+    Properties:
+      FunctionName: !Sub payment-app-${Environment}
+      Runtime: nodejs18.x
+      Handler: lambda.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Timeout: !FindInMap [EnvConfig, !Ref Environment, LambdaTimeout]
+      MemorySize: !FindInMap [EnvConfig, !Ref Environment, LambdaMemory]
+      Environment:
+        Variables:
+          NODE_ENV: !Ref Environment
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+          IDEMPOTENCY_CACHE_TABLE: !Ref IdempotencyCacheTable
+          TRANSACTIONS_TABLE: !Ref TransactionsTable
+          PAYMENT_LOGS_TABLE: !Ref PaymentLogsTable
+          STRIPE_SECRET_KEY: !Sub '{{resolve:secretsmanager:${StripeSecret}:SecretString:secret_key}}'
+          STRIPE_PUBLISHABLE_KEY: !Sub '{{resolve:secretsmanager:${StripeSecret}:SecretString:publishable_key}}'
+          STRIPE_WEBHOOK_SECRET: !Sub '{{resolve:secretsmanager:${StripeSecret}:SecretString:webhook_secret}}'
+
+  # ----------------------------------------------------------------------------
+  # API GATEWAY HTTP API
+  # ----------------------------------------------------------------------------
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub payment-app-api-${Environment}
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !Split [',', !Ref AllowedOrigins]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Idempotency-Key
+          - X-Request-Id
+        MaxAge: 300
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PaymentLambda.Arn
+      PayloadFormatVersion: '2.0'
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub integrations/${LambdaIntegration}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PaymentLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+
+  ApiEndpoint:
+    Description: API Gateway endpoint — use this as your base URL
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  PaymentLambdaName:
+    Description: Lambda function name
+    Value: !Ref PaymentLambda
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaName
+
+  IdempotencyCacheTableName:
+    Description: DynamoDB idempotency cache table
+    Value: !Ref IdempotencyCacheTable
+    Export:
+      Name: !Sub ${AWS::StackName}-IdempotencyTable
+
+  TransactionsTableName:
+    Description: DynamoDB transactions table
+    Value: !Ref TransactionsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-TransactionsTable
+
+  PaymentLogsTableName:
+    Description: DynamoDB payment logs table
+    Value: !Ref PaymentLogsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-LogsTable

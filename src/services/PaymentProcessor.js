@@ -1,8 +1,12 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { v4: uuidv4 } = require('uuid');
-const pool = require('../config/db');
+const { GetCommand, PutCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+const docClient = require('../config/dynamodb');
 const logger = require('../utils/logger');
 const { hashPayload, validateIdempotencyKey } = require('../utils/hash');
+
+const IDEMPOTENCY_TABLE = process.env.IDEMPOTENCY_CACHE_TABLE;
+const TRANSACTIONS_TABLE = process.env.TRANSACTIONS_TABLE;
 
 class PaymentProcessor {
   async processPayment(req) {
@@ -44,7 +48,7 @@ class PaymentProcessor {
         return { statusCode: 400, body: errorResponse };
       }
 
-      const fraudCheck = await this.performFraudChecks(req.body, metadata);
+      const fraudCheck = await this.performFraudChecks(req.body);
       if (fraudCheck.blocked) {
         const errorResponse = this.buildErrorResponse(idempotencyKey,
           { code: 'fraud_detected', message: 'Transaction blocked by fraud detection' }, false);
@@ -67,8 +71,9 @@ class PaymentProcessor {
         return { statusCode: 400, body: errorResponse };
       }
 
-      const transactionRecord = await this.createTransactionRecord({
-        transactionId: uuidv4(),
+      const transactionId = uuidv4();
+      await this.createTransactionRecord({
+        transactionId,
         orderId: transaction.orderId,
         customerId: customer.customerId,
         amount: transaction.amount,
@@ -79,22 +84,22 @@ class PaymentProcessor {
 
       const successResponse = {
         status: 'success',
-        transactionId: transactionRecord.transaction_id,
+        transactionId,
         idempotencyKey,
         amount: transaction.amount,
         currency: transaction.currency,
         orderId: transaction.orderId,
         timestamp: new Date().toISOString(),
         receipt: {
-          receiptUrl: `https://receipts.payment.com/${transactionRecord.transaction_id}`,
-          receiptId: transactionRecord.transaction_id
+          receiptUrl: `https://receipts.payment.com/${transactionId}`,
+          receiptId: transactionId
         }
       };
 
       await this.cacheResponse(idempotencyKey, customer.customerId, transaction.orderId,
         req.body, successResponse, 'completed');
       await logger.log(idempotencyKey, customer.customerId, 'PAYMENT_COMPLETE',
-        { transactionId: transactionRecord.transaction_id }, requestId);
+        { transactionId }, requestId);
 
       console.log(`✓ Payment processed in ${Date.now() - startTime}ms (${idempotencyKey})`);
       return { statusCode: 200, body: successResponse };
@@ -114,20 +119,20 @@ class PaymentProcessor {
   }
 
   async checkIdempotencyCache(idempotencyKey) {
-    const result = await pool.query(
-      `SELECT response_payload, status, created_at
-       FROM idempotency_cache
-       WHERE idempotency_key = $1 AND expires_at > NOW()`,
-      [idempotencyKey]
-    );
+    const result = await docClient.send(new GetCommand({
+      TableName: IDEMPOTENCY_TABLE,
+      Key: { idempotencyKey }
+    }));
 
-    if (result.rows.length > 0) {
-      const { response_payload, status, created_at } = result.rows[0];
+    if (result.Item) {
+      // Guard against DynamoDB TTL propagation delay
+      if (result.Item.expiresAt < Math.floor(Date.now() / 1000)) {
+        return { found: false };
+      }
       return {
         found: true,
-        response: JSON.parse(response_payload),
-        status,
-        age: Date.now() - new Date(created_at).getTime()
+        response: JSON.parse(result.Item.responsePayload),
+        status: result.Item.status
       };
     }
 
@@ -135,16 +140,20 @@ class PaymentProcessor {
   }
 
   async cacheResponse(idempotencyKey, customerId, orderId, request, response, status) {
-    await pool.query(
-      `INSERT INTO idempotency_cache
-       (idempotency_key, customer_id, order_id, request_hash, request_payload, response_payload, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (idempotency_key) DO UPDATE SET
-         response_payload = EXCLUDED.response_payload,
-         status = EXCLUDED.status`,
-      [idempotencyKey, customerId, orderId, hashPayload(request),
-       JSON.stringify(request), JSON.stringify(response), status]
-    );
+    await docClient.send(new PutCommand({
+      TableName: IDEMPOTENCY_TABLE,
+      Item: {
+        idempotencyKey,
+        customerId,
+        orderId,
+        requestHash: hashPayload(request),
+        requestPayload: JSON.stringify(request),
+        responsePayload: JSON.stringify(response),
+        status,
+        createdAt: Math.floor(Date.now() / 1000),
+        expiresAt: Math.floor(Date.now() / 1000) + 24 * 60 * 60  // 24-hour TTL
+      }
+    }));
   }
 
   validatePayload(body) {
@@ -172,28 +181,38 @@ class PaymentProcessor {
     return { valid: true };
   }
 
-  async performFraudChecks(payload, metadata) {
+  async performFraudChecks(payload) {
     const { transaction, customer } = payload;
 
-    const recentTransactions = await pool.query(
-      `SELECT COUNT(*) as count FROM transactions
-       WHERE customer_id = $1 AND created_at > NOW() - INTERVAL '5 minutes'`,
-      [customer.customerId]
-    );
+    // Velocity check: > 5 transactions per customer in 5 minutes
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const recentResult = await docClient.send(new QueryCommand({
+      TableName: TRANSACTIONS_TABLE,
+      IndexName: 'customerId-createdAt-index',
+      KeyConditionExpression: 'customerId = :cid AND createdAt > :cutoff',
+      ExpressionAttributeValues: { ':cid': customer.customerId, ':cutoff': fiveMinutesAgo },
+      Select: 'COUNT'
+    }));
 
-    if (parseInt(recentTransactions.rows[0].count) > 5) {
+    if (recentResult.Count > 5) {
       return { blocked: true, reason: 'Too many transactions in short time' };
     }
 
-    const avgTransaction = await pool.query(
-      `SELECT AVG(amount) as avg_amount FROM transactions
-       WHERE customer_id = $1 AND created_at > NOW() - INTERVAL '90 days'`,
-      [customer.customerId]
-    );
+    // Amount anomaly: > 10x 90-day average (log only, don't block)
+    const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    const historyResult = await docClient.send(new QueryCommand({
+      TableName: TRANSACTIONS_TABLE,
+      IndexName: 'customerId-createdAt-index',
+      KeyConditionExpression: 'customerId = :cid AND createdAt > :cutoff',
+      ExpressionAttributeValues: { ':cid': customer.customerId, ':cutoff': ninetyDaysAgo },
+      ProjectionExpression: 'amount'
+    }));
 
-    const avgAmount = parseInt(avgTransaction.rows[0].avg_amount) || 0;
-    if (avgAmount > 0 && transaction.amount > avgAmount * 10) {
-      console.warn(`⚠ High-value transaction: ${transaction.amount} vs avg ${avgAmount}`);
+    if (historyResult.Items.length > 0) {
+      const avg = historyResult.Items.reduce((s, i) => s + i.amount, 0) / historyResult.Items.length;
+      if (transaction.amount > avg * 10) {
+        console.warn(`⚠ High-value transaction: ${transaction.amount} vs avg ${avg}`);
+      }
     }
 
     return { blocked: false };
@@ -201,7 +220,6 @@ class PaymentProcessor {
 
   async chargeCard(payload, requestId) {
     const { transaction, paymentMethod, customer } = payload;
-
     return stripe.charges.create({
       amount: transaction.amount,
       currency: transaction.currency,
@@ -213,15 +231,24 @@ class PaymentProcessor {
   }
 
   async createTransactionRecord(data) {
-    const result = await pool.query(
-      `INSERT INTO transactions
-       (transaction_id, order_id, customer_id, amount, currency, status, stripe_charge_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`,
-      [data.transactionId, data.orderId, data.customerId,
-       data.amount, data.currency, data.status, data.stripeChargeId]
-    );
-    return result.rows[0];
+    const now = new Date().toISOString();
+    await docClient.send(new PutCommand({
+      TableName: TRANSACTIONS_TABLE,
+      Item: {
+        transactionId: data.transactionId,
+        orderId: data.orderId,
+        customerId: data.customerId,
+        amount: data.amount,
+        currency: data.currency,
+        status: data.status,
+        stripeChargeId: data.stripeChargeId,
+        paymentMethodType: 'card_token',
+        createdAt: now,
+        updatedAt: now
+      },
+      ConditionExpression: 'attribute_not_exists(transactionId)'
+    }));
+    return data;
   }
 
   buildErrorResponse(idempotencyKey, error, retryable = false) {
@@ -236,13 +263,11 @@ class PaymentProcessor {
 
   mapStripeError(stripeError) {
     const { type, code, message } = stripeError;
-
     if (type === 'StripeCardError') {
       if (code === 'card_declined') return { code: 'card_declined', message: 'Card was declined' };
       if (code === 'insufficient_funds') return { code: 'insufficient_funds', message: 'Insufficient funds' };
     }
     if (type === 'RateLimitError') return { code: 'rate_limit', message: 'Too many requests. Please retry.' };
-
     return { code: 'payment_failed', message: message || 'Payment processing failed' };
   }
 }

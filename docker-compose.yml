@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      IDEMPOTENCY_CACHE_TABLE: payment-idempotency-cache-development
+      TRANSACTIONS_TABLE: payment-transactions-development
+      PAYMENT_LOGS_TABLE: payment-logs-development
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      ALLOWED_ORIGINS: http://localhost:3000
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    ports:
+      - "8000:8000"
+    command: -jar DynamoDBLocal.jar -sharedDb -inMemory
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:8000 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  dynamodb-admin:
+    image: aaronshaf/dynamodb-admin:latest
+    ports:
+      - "8001:8001"
+    environment:
+      DYNAMO_ENDPOINT: http://dynamodb-local:8000
+    depends_on:
+      - dynamodb-local

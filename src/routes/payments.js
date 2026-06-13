@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../config/db');
+const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+const docClient = require('../config/dynamodb');
 const PaymentProcessor = require('../services/PaymentProcessor');
 
 const processor = new PaymentProcessor();
@@ -12,25 +13,14 @@ router.post('/create', async (req, res) => {
 
 router.get('/:transactionId', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT * FROM transactions WHERE transaction_id = $1',
-      [req.params.transactionId]
-    );
-    if (result.rows.length === 0) {
+    const result = await docClient.send(new GetCommand({
+      TableName: process.env.TRANSACTIONS_TABLE,
+      Key: { transactionId: req.params.transactionId }
+    }));
+    if (!result.Item) {
       return res.status(404).json({ error: 'Transaction not found' });
     }
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.post('/admin/cleanup-cache', async (req, res) => {
-  try {
-    const result = await pool.query(
-      'DELETE FROM idempotency_cache WHERE expires_at < NOW()'
-    );
-    res.json({ cleaned: result.rowCount, message: 'Cache cleanup completed' });
+    res.json(result.Item);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
