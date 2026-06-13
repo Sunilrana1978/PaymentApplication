@@ -396,6 +396,88 @@ UUIDs are validated server-side with a strict regex. Sequential or predictable k
 
 Double-clicks, network timeouts, and page refreshes are all safe — only one charge ever occurs per order.
 
+## How Fraud Detection Works
+
+Two independent checks run on every new payment request (cache misses only — replays skip fraud checks entirely).
+
+```
+Incoming payment request (cache miss)
+             │
+             ▼
+┌─────────────────────────────────┐
+│  Check 1: Velocity              │  DynamoDB Query on
+│  >5 transactions by this        │  customerId-createdAt-index
+│  customer in the last 5 min?    │  (SELECT COUNT)
+└────────────┬────────────────────┘
+             │
+          Yes│ Block                   No│ Continue
+             ▼                          ▼
+    HTTP 403 fraud_detected   ┌─────────────────────────────────┐
+    (not cached, not charged) │  Check 2: Amount Anomaly        │  DynamoDB Query on
+                              │  Is this amount >10× the        │  customerId-createdAt-index
+                              │  customer's 90-day average?     │  (ProjectionExpression: amount)
+                              └────────────┬────────────────────┘
+                                           │
+                                   Yes│ Warn            No│ Pass
+                                       ▼                   ▼
+                               console.warn +        Proceed to
+                               log, but allow        stripe.charges.create
+                               the charge
+```
+
+### Check 1 — Velocity (hard block)
+
+Queries `TransactionsTable` via the `customerId-createdAt-index` GSI for all records where `createdAt > now - 5 minutes`. Only the count is fetched (`Select: COUNT`) — no data is transferred.
+
+| Threshold | Action | HTTP response |
+|-----------|--------|---------------|
+| ≤ 5 transactions in 5 min | Allow | Continue to charge |
+| > 5 transactions in 5 min | **Block** | `403 fraud_detected` |
+
+The block response is **not cached** in `IdempotencyCacheTable`. If the same idempotency key is retried after the velocity window clears, the check runs again and may pass.
+
+### Check 2 — Amount Anomaly (soft flag)
+
+Queries the same GSI for all transactions in the past 90 days, projecting only the `amount` field. Computes the customer's average and compares it to the current request.
+
+| Condition | Action |
+|-----------|--------|
+| No history (new customer) | Skip — no average to compare |
+| Amount ≤ 10× 90-day average | Allow silently |
+| Amount > 10× 90-day average | `console.warn` + allow (charge still proceeds) |
+
+This is a **soft signal** — it flags unusual amounts for manual review without blocking legitimate large purchases (e.g. a customer's first enterprise order).
+
+### Why two separate checks?
+
+| | Velocity | Amount Anomaly |
+|-|----------|----------------|
+| **Detects** | Credential stuffing, card testing loops | Account takeover, unusual single transaction |
+| **Time window** | 5 minutes | 90 days |
+| **Data fetched** | COUNT only (cheap) | All amounts (heavier, but infrequent trigger) |
+| **Action** | Hard block | Log & allow |
+| **False-positive risk** | Low (rate is the signal) | Medium (first big purchase looks anomalous) |
+
+### What is NOT checked
+
+- **Geographic / IP anomaly** — not implemented; would require storing IP per transaction.
+- **Card BIN validation** — Stripe handles this on their end.
+- **Cross-customer patterns** — checks are scoped per `customerId`; no global velocity ring is implemented.
+- **Cached responses** — fraud checks are **skipped entirely** for idempotency cache hits. The first request bears the cost; retries are free.
+
+### DynamoDB access pattern
+
+Both checks share the same GSI: `customerId-createdAt-index` on `TransactionsTable`.
+
+```
+GSI Key:   customerId (PK)  +  createdAt (SK, ISO 8601 string)
+           ──────────────────────────────────────────────────
+           Enables range queries:  createdAt > "<cutoff>"
+           Without a full table scan
+```
+
+ISO 8601 strings sort lexicographically in the same order as chronologically, so `createdAt > "2026-06-13T10:00:00.000Z"` is a valid and efficient DynamoDB range condition.
+
 ## DynamoDB Tables
 
 | Table | Key | TTL | Purpose |
