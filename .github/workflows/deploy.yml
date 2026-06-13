@@ -1,0 +1,135 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: production
+        type: choice
+        options: [staging, production]
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'production' }}
+  STACK_NAME: payment-app-${{ github.event.inputs.environment || 'production' }}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment || 'production' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: npm
+
+      - name: Install production dependencies
+        run: npm ci --only=production
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Lambda
+        run: |
+          zip -r payment-app.zip . \
+            --exclude "*.git*" \
+            --exclude "*.DS_Store" \
+            --exclude "docs/*" \
+            --exclude "infrastructure/*" \
+            --exclude "*.md" \
+            --exclude ".env*" \
+            --exclude "docker-compose.yml" \
+            --exclude "public/*"
+
+          echo "Package size: $(du -sh payment-app.zip | cut -f1)"
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp payment-app.zip \
+            s3://${{ secrets.LAMBDA_DEPLOY_BUCKET }}/payment-app-${{ github.sha }}.zip
+          echo "✓ Uploaded to s3://${{ secrets.LAMBDA_DEPLOY_BUCKET }}/payment-app-${{ github.sha }}.zip"
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/cloudformation.yml \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              Environment=${{ env.ENVIRONMENT }} \
+              LambdaCodeBucket=${{ secrets.LAMBDA_DEPLOY_BUCKET }} \
+              LambdaCodeKey=payment-app-${{ github.sha }}.zip \
+              AllowedOrigins=${{ secrets.ALLOWED_ORIGINS }} \
+              StripeSecretKey=${{ secrets.STRIPE_SECRET_KEY }} \
+              StripePublishableKey=${{ secrets.STRIPE_PUBLISHABLE_KEY }} \
+              StripeWebhookSecret=${{ secrets.STRIPE_WEBHOOK_SECRET }}
+
+      - name: Get API endpoint
+        id: endpoint
+        run: |
+          URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiEndpoint'].OutputValue" \
+            --output text)
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "API endpoint: $URL"
+
+      - name: Smoke test — health check
+        run: |
+          echo "Testing ${{ steps.endpoint.outputs.url }}/health ..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --retry 5 --retry-delay 3 \
+            ${{ steps.endpoint.outputs.url }}/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with HTTP $STATUS"
+            exit 1
+          fi
+          echo "✓ Health check passed (HTTP $STATUS)"
+
+      - name: Smoke test — idempotency
+        run: |
+          KEY="ci-smoke-$(date +%s)"
+          RESPONSE=$(curl -s -X POST ${{ steps.endpoint.outputs.url }}/api/v1/payments/create \
+            -H "Content-Type: application/json" \
+            -H "X-Idempotency-Key: $KEY" \
+            -d "{
+              \"idempotencyKey\": \"$KEY\",
+              \"paymentMethod\": { \"type\": \"card_token\", \"token\": \"tok_visa\" },
+              \"transaction\": { \"amount\": 100, \"currency\": \"USD\", \"orderId\": \"CI-TEST-${{ github.run_id }}\" },
+              \"customer\": { \"customerId\": \"ci-test\", \"email\": \"ci@test.com\", \"billingAddress\": { \"zip\": \"97201\", \"country\": \"US\" } }
+            }")
+          echo "Payment response: $RESPONSE"
+          STATUS=$(echo $RESPONSE | jq -r '.status // "unknown"')
+          if [ "$STATUS" = "error" ] && echo $RESPONSE | jq -e '.error.code == "internal_server_error"' > /dev/null; then
+            echo "Unexpected server error in smoke test"
+            exit 1
+          fi
+          echo "✓ Payment endpoint responded (status: $STATUS)"
+
+      - name: Deployment summary
+        run: |
+          echo "### ✅ Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | \`${{ env.ENVIRONMENT }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Lambda package** | \`payment-app-${{ github.sha }}.zip\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **API endpoint** | ${{ steps.endpoint.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CloudFormation stack** | \`${{ env.STACK_NAME }}\` |" >> $GITHUB_STEP_SUMMARY

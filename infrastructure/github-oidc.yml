@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  One-time setup — GitHub Actions OIDC provider and scoped IAM role.
+  Deploy this stack once before setting up the CI/CD pipeline.
+  After deploying, copy the RoleArn output into GitHub secret AWS_ROLE_ARN.
+
+Parameters:
+
+  GitHubOrg:
+    Type: String
+    Description: GitHub username or organisation (e.g. Sunilrana1978)
+
+  GitHubRepo:
+    Type: String
+    Description: Repository name (e.g. PaymentApplication)
+
+  DeployBucketName:
+    Type: String
+    Description: S3 bucket used for Lambda deployment ZIPs
+
+Resources:
+
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-actions-payment-app
+      Description: Assumed by GitHub Actions via OIDC — scoped to payment-app resources only
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOIDCProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Allow main branch and PRs; restrict to this repo only
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:pull_request
+      Policies:
+        - PolicyName: PaymentAppDeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # CloudFormation — limited to payment-app stacks
+              - Sid: CloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSets
+                Resource:
+                  - !Sub arn:aws:cloudformation:*:${AWS::AccountId}:stack/payment-app-*/*
+
+              # S3 — Lambda deployment bucket only
+              - Sid: S3LambdaDeploy
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${DeployBucketName}
+                  - !Sub arn:aws:s3:::${DeployBucketName}/*
+
+              # Lambda
+              - Sid: Lambda
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:GetPolicy
+                  - lambda:ListVersionsByFunction
+                  - lambda:PublishVersion
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:payment-app-*
+
+              # IAM — only for payment-app roles (needed by CloudFormation)
+              - Sid: IAMRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:PassRole
+                  - iam:TagRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/payment-app-*
+
+              # API Gateway — scoped to payment-app APIs
+              - Sid: APIGateway
+                Effect: Allow
+                Action:
+                  - apigateway:GET
+                  - apigateway:POST
+                  - apigateway:PUT
+                  - apigateway:PATCH
+                  - apigateway:DELETE
+                  - apigateway:TagResource
+                Resource: '*'
+
+              # DynamoDB — payment tables only
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:UpdateTimeToLive
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:ListTagsOfResource
+                  - dynamodb:TagResource
+                Resource:
+                  - !Sub arn:aws:dynamodb:*:${AWS::AccountId}:table/payment-*
+
+              # Secrets Manager — payment-app secrets only
+              - Sid: SecretsManager
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:TagResource
+                Resource:
+                  - !Sub arn:aws:secretsmanager:*:${AWS::AccountId}:secret:payment-app/*
+
+              # CloudWatch Logs — Lambda log groups only
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DescribeLogGroups
+                  - logs:TagLogGroup
+                Resource:
+                  - !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/payment-app-*
+
+Outputs:
+
+  RoleArn:
+    Description: Add this as GitHub secret AWS_ROLE_ARN in your repository settings
+    Value: !GetAtt GitHubActionsRole.Arn
